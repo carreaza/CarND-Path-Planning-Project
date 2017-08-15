@@ -1,3 +1,23 @@
+#Notes from Carlos Arreaza Aug 2017
+
+Prediction Model:
+I am using a simple prediction model assuming every vehicle on the road has constant velocity and stays in their lane to predict their position in a future state. With the sensor_fusion data, I am able to calculate the future position of a vehicle using its velocity.
+Further improvements can be to take into account the d coordinate to see if vehicles have some intent to change lanes and to see their behaviour with respect to time to see if their velocities are changing (acceleration != 0).
+
+Behaviour Model:
+I am taking advantage of the fact that the ego vehicle is driving in a highway of 3 lanes with a specified max speed. Thus, there are 3 possible states: keep lane, change lane left (LCL), or change lane right (LCR).
+Keep lane: if there is no vehicle in front of the ego vehicle that prevents it from going at max speed, then stay in keep lane. Otherwise, try LCL or LCR.
+LCL & LCR: check leading vehicles in both left and right lanes and see which one has 'spot' for a possible lane change by checking the S coordinate with a given buffer distance.
+If 'spot' is found, and ego vehicle is able to change into that lane, then make the change lane by changing the d coordinate in the ego vehicle.
+
+Further improvements can be to add cost functions for speed, time to reach goal, time wasted slowing down, changing lanes, and others to optimize the behaviour planner. As for now, the planner is very efficient as it is a very simple use case (highway driving with little traffic).
+
+Path Generation:
+Once the desired state is chosen, 3 points are chosen in front of the ego vehicle: 30m, 60m, and 90m ahead. Using the spline.h function we are able to create a smooth path given the 3 xy points. The spline is able to eliminate any jerk or high acceleration events when changing lanes or doing other maneuvers.
+Finally, we create evenly separated points using the spline and the desired velocity. The separation of the points will be set by the velocity.
+
+
+
 # CarND-Path-Planning-Project
 Self-Driving Car Engineer Nanodegree Program
    
