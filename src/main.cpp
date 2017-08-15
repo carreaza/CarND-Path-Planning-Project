@@ -5,14 +5,21 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include "Eigen-3.3/Eigen/Dense"
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
+using Eigen::MatrixXd;
+using Eigen::VectorXd;
 
 // for convenience
 using json = nlohmann::json;
+
+int lane = 1; //starting lane position available lanes from left to right: 0,1,2
+double ref_vel = 0.0; //starting velocity of the ego vehicle
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
@@ -159,6 +166,56 @@ vector<double> getXY(double s, double d, vector<double> maps_s, vector<double> m
 
 }
 
+vector<double> JMT(vector< double> start, vector <double> end, double T)
+{
+    /*
+       Calculate the Jerk Minimizing Trajectory that connects the initial state
+       to the final state in time T.
+
+       INPUTS
+
+       start - the vehicles start location given as a length three array
+           corresponding to initial values of [s, s_dot, s_double_dot]
+
+       end   - the desired end state for vehicle. Like "start" this is a
+           length three array.
+
+       T     - The duration, in seconds, over which this maneuver should occur.
+
+       OUTPUT
+       an array of length 6, each value corresponding to a coefficent in the polynomial
+       s(t) = a_0 + a_1 * t + a_2 * t**2 + a_3 * t**3 + a_4 * t**4 + a_5 * t**5
+
+       EXAMPLE
+
+       > JMT( [0, 10, 0], [10, 10, 0], 1)
+       [0.0, 10.0, 0.0, 0.0, 0.0, 0.0]
+       */
+
+    MatrixXd A = MatrixXd(3, 3);
+    A << T*T*T, T*T*T*T, T*T*T*T*T,
+            3*T*T, 4*T*T*T,5*T*T*T*T,
+            6*T, 12*T*T, 20*T*T*T;
+
+    MatrixXd B = MatrixXd(3,1);
+    B << end[0]-(start[0]+start[1]*T+.5*start[2]*T*T),
+            end[1]-(start[1]+start[2]*T),
+            end[2]-start[2];
+
+    MatrixXd Ai = A.inverse();
+
+    MatrixXd C = Ai*B;
+
+    vector <double> result = {start[0], start[1], .5*start[2]};
+    for(int i = 0; i < C.size(); i++)
+    {
+        result.push_back(C.data()[i]);
+    }
+
+    return result;
+}
+
+
 int main() {
   uWS::Hub h;
 
@@ -222,6 +279,13 @@ int main() {
           	double car_d = j[1]["d"];
           	double car_yaw = j[1]["yaw"];
           	double car_speed = j[1]["speed"];
+//            TODO: For DEBUGGING
+//            cout<<"car_x: "<<car_x<<endl;
+//            cout<<"car_y: "<<car_y<<endl;
+//            cout<<"car_d: "<<car_d<<endl;
+//            cout<<"car_s: "<<car_s<<endl;
+//            cout<<"car_yaw: "<<car_yaw<<endl;
+//            cout<<"car_speed: "<<car_speed<<endl;
 
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
@@ -235,15 +299,224 @@ int main() {
 
           	json msgJson;
 
+            int prev_size = previous_path_x.size();
+
+            if(prev_size > 0){
+                car_s = end_path_s;
+            }
+
+            bool too_close = false;
+            bool can_change_lane =  false;
+            int desired_lane;
+            double dist_left = 100000;
+            double dist_right = 100000;
+            int left_lead_id = -1;
+            int right_lead_id = -1;
+
+            //find ref_v to use
+            for(int i=0;i<sensor_fusion.size();i++){
+                //car is in my lane
+                float d = sensor_fusion[i][6];
+                double vx = sensor_fusion[i][3];
+                double vy = sensor_fusion[i][4];
+                double check_speed = sqrt(vx * vx + vy * vy);
+                double check_car_s = sensor_fusion[i][5];
+
+                if(d<(2+4*lane+2) && d > (2+4*lane-2)) {//if vehicle is in the same lane, check if too close from ego vehicle
+                    check_car_s += ((double) prev_size * 0.02 * check_speed);
+                    //check s values greater than mine and s gap
+                    if ((check_car_s > car_s) && ((check_car_s - car_s) < 30)) {
+                        too_close = true;
+                    }
+                }
+                //vehicles not in my lane
+                else{
+                    //LCL
+                    if((lane - 1)>=0){//check if we can turn left
+                        if((d<(2+4*(lane-1)+2) && d > (2+4*(lane-1)-2))){//check if sensor_fusion data is from left lane
+                            if(check_car_s > (car_s-19) && (check_car_s-car_s) < dist_left){//find leading vehicle
+                                dist_left = check_car_s-car_s;
+                                left_lead_id = i;
+//                                cout<<"left_dist: " << dist_left<<endl;
+//                                cout<<"left_id: " << left_lead_id<<endl;
+                            }
+                        }
+                    }
+
+                    //LCR
+                    if((lane + 1) <=2){//check if we can turn right
+                        if((d<(2+4*(lane+1)+2) && d > (2+4*(lane+1)-2))){//check if sensor_fusion data is from right lane
+                            if(check_car_s> (car_s-19) && (check_car_s-car_s) < dist_right){//find leading vehicle
+                                dist_right = check_car_s-car_s;
+                                right_lead_id = i;
+//                                cout<<"right_dist: " << dist_right<<endl;
+//                                cout<<"right_id: " << right_lead_id<<endl;
+                            }
+                        }
+                    }
+                }
+            }
+
+            //Now, check if leading vehicles are too close
+//            cout<<"left_dist: " << dist_left<<endl;
+//            cout<<"left_id: " << left_lead_id<<endl;
+//            cout<<"right_dist: " << dist_right<<endl;
+//            cout<<"right_id: " << right_lead_id<<endl;
+
+            //LCL
+            if((lane - 1) >=0){//check if left lane change is possible
+                if(left_lead_id != -1){
+                    double check_car_s_left = sensor_fusion[left_lead_id][5];
+                    if((check_car_s_left - car_s) > 30){//we have enough space, can change lanes
+                        can_change_lane = true;
+                        desired_lane = lane -1;
+                    }
+                }
+                else{//no leading vehicle was found, can change lanes
+                    can_change_lane = true;
+                    desired_lane = lane -1;
+                }
+            }
+
+            //LCR
+            if((lane + 1) <=2){//check if right lane change is possible
+                if(right_lead_id != -1){
+                    double check_car_s_right = sensor_fusion[right_lead_id][5];
+                    if((check_car_s_right - car_s) > 30){//we have enough space to change, can change lanes
+                        can_change_lane = true;
+                        desired_lane = lane+1;
+                    }
+                }
+                else{//no leading vehicle was found, can change lanes
+                    can_change_lane = true;
+                    desired_lane = lane+1;
+                }
+            }
+
+            if(too_close){//if too close, reduce speed
+//                ref_vel -= .224;
+                ref_vel -=.29;
+            }
+            else if(ref_vel < 49.5){//if not at max speed, increase speed
+                //ref_vel += .224;
+                ref_vel += .28;
+            }
+            //can change lanes right now
+            if(can_change_lane && too_close){
+                lane = desired_lane;
+            }
+
+
+            vector<double> ptsx;
+            vector<double> ptsy;
+
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+
+            //if previous state is almost empty
+            if(prev_size < 2){
+
+                double prev_car_x = car_x - cos(car_yaw);
+                double prev_car_y = car_y - sin(car_yaw);
+
+                ptsx.push_back(prev_car_x);
+                ptsx.push_back(car_x);
+                ptsy.push_back(prev_car_y);
+                ptsy.push_back(car_y);
+            }
+            else {
+                ref_x = previous_path_x[prev_size-1];
+                ref_y = previous_path_y[prev_size-1];
+
+                //redefine reference points
+                double ref_x_prev = previous_path_x[prev_size-2];
+                double ref_y_prev = previous_path_y[prev_size-2];
+                ref_yaw = atan2(ref_y-ref_y_prev, ref_x-ref_x_prev);
+
+                //Us two points to make the path tangent to the previous path
+                ptsx.push_back(ref_x_prev);
+                ptsx.push_back(ref_x);
+
+                ptsy.push_back(ref_y_prev);
+                ptsy.push_back(ref_y);
+            }
+            //define 3 points at 30m, 60m, and 90m ahead in the current lane
+            vector<double> next_wp0 = getXY(car_s+30, (2+4*lane), map_waypoints_s,map_waypoints_x,map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s+60, (2+4*lane), map_waypoints_s,map_waypoints_x,map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s+90, (2+4*lane), map_waypoints_s,map_waypoints_x,map_waypoints_y);
+
+            ptsx.push_back(next_wp0[0]);
+            ptsx.push_back(next_wp1[0]);
+            ptsx.push_back(next_wp2[0]);
+
+            ptsy.push_back(next_wp0[1]);
+            ptsy.push_back(next_wp1[1]);
+            ptsy.push_back(next_wp2[1]);
+
+            for(int i = 0; i<ptsx.size();i++){
+
+                //shift car reference angle to 0 degrees
+                double shift_x = ptsx[i]-ref_x;
+                double shift_y = ptsy[i]-ref_y;
+
+                ptsx[i] = (shift_x*cos(0-ref_yaw)-shift_y*sin(0-ref_yaw));
+                ptsy[i] = (shift_x*sin(0-ref_yaw)+shift_y*cos(0-ref_yaw));
+            }
+
+
+            //create a spline
+            tk::spline s;
+
+            s.set_points(ptsx,ptsy);
+
+            //Define the actual (x,y) points we will use for the planner
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
 
+            //Start with all the previous points from the last time
+            for(int i = 0;i<previous_path_x.size();i++){
+                next_x_vals.push_back(previous_path_x[i]);
+                next_y_vals.push_back(previous_path_y[i]);
+            }
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
-          	msgJson["next_y"] = next_y_vals;
+            double target_x = 30;
+            double target_y = s(target_x);
+            double target_dist = sqrt((target_x)*(target_x) + (target_y)*(target_y));
 
-          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+            double x_add_on = 0;
+
+            for(int i = 1; i<=50-previous_path_x.size();i++){
+
+//                double N = (target_dist/(.02*road.vehicles.at(-1).v));
+                double N = (target_dist/(.02*ref_vel/2.24));
+                double x_point = x_add_on+(target_x)/N;
+                double y_point = s(x_point);
+
+                x_add_on = x_point;
+
+                double x_ref = x_point;
+                double y_ref = y_point;
+
+                //rotate back to normal coordinate system
+                x_point = (x_ref*cos(ref_yaw)-y_ref*sin(ref_yaw));
+                y_point = (x_ref*sin(ref_yaw)+y_ref*cos(ref_yaw));
+
+                x_point += ref_x;
+                y_point += ref_y;
+
+                next_x_vals.push_back(x_point);
+                next_y_vals.push_back(y_point);
+            }
+
+//            cout<<"||||||||END OF ONE CYCLE||||||||||||||"<<endl;
+//            cout<<endl;
+
+            msgJson["next_x"] = next_x_vals;
+            msgJson["next_y"] = next_y_vals;
+
+
+            auto msg = "42[\"control\","+ msgJson.dump()+"]";
 
           	//this_thread::sleep_for(chrono::milliseconds(1000));
           	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
